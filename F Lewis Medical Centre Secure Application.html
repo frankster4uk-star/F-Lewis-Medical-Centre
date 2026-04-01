@@ -1,0 +1,1415 @@
+
+
+Text
+
+secure-medical-app/
+├── config/
+│   └── config.php
+├── app/
+│   ├── controllers/
+│   │   ├── AuthController.php
+│   │   ├── AppointmentController.php
+│   │   └── ApiAppointmentController.php
+│   ├── models/
+│   │   ├── User.php
+│   │   ├── Patient.php
+│   │   ├── Appointment.php
+│   │   └── AuditLog.php
+│   ├── services/
+│   │   ├── ValidationService.php
+│   │   ├── AuditService.php
+│   │   └── JwtService.php
+│   ├── security/
+│   │   ├── Access.php
+│   │   └── Csrf.php
+│   └── helpers/
+│       └── Response.php
+├── public/
+│   ├── index.php
+│   ├── mfa.php
+│   ├── dashboard.php
+│   ├── logout.php
+│   ├── appointments/
+│   │   ├── list.php
+│   │   ├── create.php
+│   │   ├── edit.php
+│   │   └── delete.php
+│   ├── api/
+│   │   └── appointments.php
+│   └── assets/
+│       ├── style.css
+│       └── app.js
+├── logs/
+│   └── app.log
+└── sql/
+    ├── schema.sql
+    └── seed.sql
+
+
+secure-medical-app/
+├── config/
+│   └── config.php
+├── app/
+│   ├── controllers/
+│   │   ├── AuthController.php
+│   │   ├── AppointmentController.php
+│   │   └── ApiAppointmentController.php
+│   ├── models/
+│   │   ├── User.php
+│   │   ├── Patient.php
+│   │   ├── Appointment.php
+│   │   └── AuditLog.php
+│   ├── services/
+│   │   ├── ValidationService.php
+│   │   ├── AuditService.php
+│   │   └── JwtService.php
+│   ├── security/
+│   │   ├── Access.php
+│   │   └── Csrf.php
+│   └── helpers/
+│       └── Response.php
+├── public/
+│   ├── index.php
+│   ├── mfa.php
+│   ├── dashboard.php
+│   ├── logout.php
+│   ├── appointments/
+│   │   ├── list.php
+│   │   ├── create.php
+│   │   ├── edit.php
+│   │   └── delete.php
+│   ├── api/
+│   │   └── appointments.php
+│   └── assets/
+│       ├── style.css
+│       └── app.js
+├── logs/
+│   └── app.log
+└── sql/
+    ├── schema.sql
+    └── seed.sql
+
+
+--- FILE:config/config.php ---
+
+
+Php
+
+
+<?php
+declare(strict_types=1);
+
+$dbHost = getenv('DB_HOST') ?: 'localhost';
+$dbName = getenv('DB_NAME') ?: 'medical_centre';
+$dbUser = getenv('DB_USER') ?: 'medical_user';
+$dbPass = getenv('DB_PASSWORD') ?: 'change_me';
+$dbPort = getenv('DB_PORT') ?: '5432';
+
+$dsn = "pgsql:host={$dbHost};port={$dbPort};dbname={$dbName};";
+
+$options = [
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    PDO::ATTR_EMULATE_PREPARES   => false,
+];
+
+try {
+    $pdo = new PDO($dsn, $dbUser, $dbPass, $options);
+} catch (PDOException $e) {
+    error_log('[DB ERROR] ' . $e->getMessage());
+    http_response_code(500);
+    exit('An error occurred. Please try again later.');
+}
+
+session_set_cookie_params([
+    'lifetime' => 0,
+    'path'     => '/',
+    'domain'   => '',
+    'secure'   => true,
+    'httponly' => true,
+    'samesite' => 'Strict',
+]);
+session_start();
+
+header('X-Frame-Options: SAMEORIGIN');
+header('X-Content-Type-Options: nosniff');
+header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';");
+
+set_exception_handler(function (Throwable $e): void {
+    error_log('[EXCEPTION] ' . $e->getMessage());
+    http_response_code(500);
+    echo 'An error occurred. Please try again later.';
+});
+
+
+Php
+
+<?php
+declare(strict_types=1);
+
+class User
+{
+    public function __construct(private PDO $pdo) {}
+
+    public function findByEmail(string $email): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT id, email, password_hash, role, mfa_secret FROM users WHERE email = :email'
+        );
+        $stmt->execute([':email' => $email]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    }
+
+    public function create(string $email, string $password, string $role, ?string $mfaSecret = null): bool
+    {
+        $hash = password_hash($password, PASSWORD_ARGON2ID);
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO users (email, password_hash, role, mfa_secret)
+             VALUES (:email, :hash, :role, :mfa_secret)'
+        );
+        return $stmt->execute([
+            ':email'      => $email,
+            ':hash'       => $hash,
+            ':role'       => $role,
+            ':mfa_secret' => $mfaSecret,
+        ]);
+    }
+
+    public function verifyPassword(array $user, string $password): bool
+    {
+        return password_verify($password, $user['password_hash']);
+    }
+}
+
+
+--- FILE: app/models/Patient.php ---
+
+Php
+
+
+<?php
+declare(strict_types=1);
+
+class Patient
+{
+    public function __construct(private PDO $pdo) {}
+
+    public function getAll(): array
+    {
+        $stmt = $this->pdo->query(
+            'SELECT id, nhs_number, first_name, last_name, date_of_birth
+             FROM patients
+             ORDER BY last_name, first_name'
+        );
+        return $stmt->fetchAll();
+    }
+
+    public function getById(int $id): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT id, nhs_number, first_name, last_name, date_of_birth
+             FROM patients WHERE id = :id'
+        );
+        $stmt->execute([':id' => $id]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    }
+}
+
+
+--- FILE: app/models/Appointment.php ---
+
+<?php
+declare(strict_types=1);
+
+class Appointment
+{
+    public function __construct(private PDO $pdo) {}
+
+    public function getAll(): array
+    {
+        $stmt = $this->pdo->query(
+            'SELECT a.id,
+                    a.patient_id,
+                    a.appointment_time,
+                    a.clinician,
+                    a.notes,
+                    p.first_name,
+                    p.last_name,
+                    p.date_of_birth
+             FROM appointments a
+             JOIN patients p ON a.patient_id = p.id
+             ORDER BY a.appointment_time ASC'
+        );
+        return $stmt->fetchAll();
+    }
+
+    public function getById(int $id): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT a.id,
+                    a.patient_id,
+                    a.appointment_time,
+                    a.clinician,
+                    a.notes,
+                    p.first_name,
+                    p.last_name,
+                    p.date_of_birth
+             FROM appointments a
+             JOIN patients p ON a.patient_id = p.id
+             WHERE a.id = :id'
+        );
+        $stmt->execute([':id' => $id]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    }
+
+    public function create(array $data): bool
+    {
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO appointments (patient_id, appointment_time, clinician, notes)
+             VALUES (:patient_id, :appointment_time, :clinician, :notes)'
+        );
+        return $stmt->execute([
+            ':patient_id'       => (int)$data['patient_id'],
+            ':appointment_time' => $data['appointment_time'],
+            ':clinician'        => $data['clinician'],
+            ':notes'            => $data['notes'] ?? '',
+        ]);
+    }
+
+    public function update(int $id, array $data): bool
+    {
+        $stmt = $this->pdo->prepare(
+            'UPDATE appointments
+             SET patient_id = :patient_id,
+                 appointment_time = :appointment_time,
+                 clinician = :clinician,
+                 notes = :notes
+             WHERE id = :id'
+        );
+        return $stmt->execute([
+            ':patient_id'       => (int)$data['patient_id'],
+            ':appointment_time' => $data['appointment_time'],
+            ':clinician'        => $data['clinician'],
+            ':notes'            => $data['notes'] ?? '',
+            ':id'               => $id,
+        ]);
+    }
+
+    public function delete(int $id): bool
+    {
+        $stmt = $this->pdo->prepare('DELETE FROM appointments WHERE id = :id');
+        return $stmt->execute([':id' => $id]);
+    }
+
+    public function getLastInsertId(): string
+    {
+        return $this->pdo->lastInsertId();
+    }
+}
+
+
+--- FILE: app/models/AuditLog.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+class AuditLog
+{
+    public function __construct(private PDO $pdo) {}
+
+    public function record(
+        string $action,
+        string $entity,
+        ?int $entityId = null,
+        array $details = []
+    ): void {
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO audit_log
+             (user_id, role, action, entity, entity_id, details, ip_address, user_agent)
+             VALUES (:user_id, :role, :action, :entity, :entity_id, :details, :ip_address, :user_agent)'
+        );
+
+        $stmt->execute([
+            ':user_id'    => $_SESSION['user_id'] ?? null,
+            ':role'       => $_SESSION['role'] ?? null,
+            ':action'     => $action,
+            ':entity'     => $entity,
+            ':entity_id'  => $entityId,
+            ':details'    => json_encode($details, JSON_THROW_ON_ERROR),
+            ':ip_address' => $_SERVER['REMOTE_ADDR'] ?? null,
+            ':user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? null,
+        ]);
+    }
+}
+
+
+--- FILE: app/services/ValidationService.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+class ValidationService
+{
+    public function validateAppointment(array $data): array
+    {
+        $errors = [];
+
+        if (empty($data['patient_id']) || !ctype_digit((string)$data['patient_id'])) {
+            $errors[] = 'Valid patient is required.';
+        }
+
+        if (empty(trim($data['clinician'] ?? ''))) {
+            $errors[] = 'Clinician is required.';
+        }
+
+        if (empty($data['appointment_time']) || !strtotime($data['appointment_time'])) {
+            $errors[] = 'A valid appointment date/time is required.';
+        }
+
+        return $errors;
+    }
+
+    public function validateUserLogin(array $data): array
+    {
+        $errors = [];
+        $email = trim($data['email'] ?? '');
+        $password = $data['password'] ?? '';
+
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $errors[] = 'Valid email is required.';
+        }
+        if ($password === '') {
+            $errors[] = 'Password is required.';
+        }
+
+        return $errors;
+    }
+}
+
+
+--- FILE: app/services/AuditService.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../models/AuditLog.php';
+
+class AuditService
+{
+    private AuditLog $log;
+
+    public function __construct(PDO $pdo)
+    {
+        $this->log = new AuditLog($pdo);
+    }
+
+    public function appointmentCreated(?int $id, array $data): void
+    {
+        $this->log->record('create', 'appointment', $id, [
+            'patient_id'       => $data['patient_id'] ?? null,
+            'appointment_time' => $data['appointment_time'] ?? null,
+            'clinician'        => $data['clinician'] ?? null,
+        ]);
+    }
+
+    public function appointmentUpdated(int $id, array $data): void
+    {
+        $this->log->record('update', 'appointment', $id, [
+            'patient_id'       => $data['patient_id'] ?? null,
+            'appointment_time' => $data['appointment_time'] ?? null,
+            'clinician'        => $data['clinician'] ?? null,
+        ]);
+    }
+
+    public function appointmentDeleted(int $id): void
+    {
+        $this->log->record('delete', 'appointment', $id);
+    }
+
+    public function loginSuccess(int $userId): void
+    {
+        $this->log->record('login_success', 'user', $userId);
+    }
+
+    public function loginFailure(string $email): void
+    {
+        $this->log->record('login_failure', 'user', null, ['email' => $email]);
+    }
+}
+
+
+
+--- File: app/services/JwtService.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+class JwtService
+{
+    public function __construct(private string $secret) {}
+
+    public function encode(array $payload): string
+    {
+        $header = ['alg' => 'HS256', 'typ' => 'JWT'];
+        $segments = [
+            $this->b64(json_encode($header, JSON_THROW_ON_ERROR)),
+            $this->b64(json_encode($payload, JSON_THROW_ON_ERROR)),
+        ];
+        $signingInput = implode('.', $segments);
+        $signature = hash_hmac('sha256', $signingInput, $this->secret, true);
+        $segments[] = $this->b64($signature);
+        return implode('.', $segments);
+    }
+
+    public function decode(string $jwt): ?array
+    {
+        $parts = explode('.', $jwt);
+        if (count($parts) !== 3) {
+            return null;
+        }
+        [$h64, $p64, $s64] = $parts;
+        $signingInput = $h64 . '.' . $p64;
+        $signature = $this->b64d($s64);
+        $expected = hash_hmac('sha256', $signingInput, $this->secret, true);
+        if (!hash_equals($expected, $signature)) {
+            return null;
+        }
+        $payload = json_decode($this->b64d($p64), true, 512, JSON_THROW_ON_ERROR);
+        return is_array($payload) ? $payload : null;
+    }
+
+    private function b64(string $data): string
+    {
+        return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+    }
+
+    private function b64d(string $data): string
+    {
+        return base64_decode(strtr($data, '-_', '+/'));
+    }
+}
+
+
+--- FILE: app/security/Access.php ---
+
+Php 
+
+<?php
+declare(strict_types=1);
+
+function requireAuth(): void
+{
+    if (!isset($_SESSION['user_id'])) {
+        header('Location: /index.php');
+        exit;
+    }
+}
+
+function requireRole(array $allowedRoles): void
+{
+    requireAuth();
+    $role = $_SESSION['role'] ?? '';
+    if (!in_array($role, $allowedRoles, true)) {
+        http_response_code(403);
+        echo 'Access denied.';
+        exit;
+    }
+}
+
+
+--- FILE: app/security/Csrf.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+function csrf_token(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function csrf_field(): string
+{
+    $token = htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8');
+    return '<input type="hidden" name="csrf_token" value="' . $token . '">';
+}
+
+function csrf_verify(?string $token): bool
+{
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], (string)$token);
+}
+
+
+
+--- FILE: app/helpers/Response.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+function json_response(array $data, int $status = 200): void
+{
+    http_response_code($status);
+    header('Content-Type: application/json');
+    echo json_encode($data, JSON_THROW_ON_ERROR);
+    exit;
+}
+
+
+
+--- FILE: APP/controllers/AuthController.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../models/User.php';
+require_once __DIR__ . '/../services/ValidationService.php';
+require_once __DIR__ . '/../services/AuditService.php';
+
+class AuthController
+{
+    private User $userModel;
+    private ValidationService $validator;
+    private AuditService $audit;
+
+    public function __construct(private PDO $pdo)
+    {
+        $this->userModel = new User($pdo);
+        $this->validator = new ValidationService();
+        $this->audit     = new AuditService($pdo);
+    }
+
+    public function login(array $post): void
+    {
+        $errors = $this->validator->validateUserLogin($post);
+        if ($errors) {
+            $_SESSION['error'] = implode(' ', $errors);
+            header('Location: /index.php');
+            exit;
+        }
+
+        $email    = trim($post['email']);
+        $password = $post['password'];
+
+        $user = $this->userModel->findByEmail($email);
+        if (!$user || !$this->userModel->verifyPassword($user, $password)) {
+            $this->audit->loginFailure($email);
+            $_SESSION['error'] = 'Invalid credentials.';
+            header('Location: /index.php');
+            exit;
+        }
+
+        $_SESSION['pending_user_id'] = $user['id'];
+        $_SESSION['pending_role']    = $user['role'];
+        $_SESSION['mfa_secret']      = $user['mfa_secret'];
+
+        header('Location: /mfa.php');
+        exit;
+    }
+
+    public function verifyMfa(array $post): void
+    {
+        $code = trim($post['mfa_code'] ?? '');
+        if ($code === '' || !isset($_SESSION['pending_user_id'], $_SESSION['mfa_secret'])) {
+            $_SESSION['error'] = 'Invalid MFA attempt.';
+            header('Location: /index.php');
+            exit;
+        }
+
+        // Placeholder: replace with real TOTP verification
+        $isValid = ($code === '123456');
+
+        if (!$isValid) {
+            $this->audit->loginFailure('MFA user ' . ($_SESSION['pending_user_id'] ?? 'unknown'));
+            $_SESSION['error'] = 'Invalid MFA code.';
+            header('Location: /mfa.php');
+            exit;
+        }
+
+        session_regenerate_id(true);
+        $_SESSION['user_id'] = $_SESSION['pending_user_id'];
+        $_SESSION['role']    = $_SESSION['pending_role'];
+
+        $userId = (int)$_SESSION['user_id'];
+
+        unset($_SESSION['pending_user_id'], $_SESSION['pending_role'], $_SESSION['mfa_secret']);
+
+        $this->audit->loginSuccess($userId);
+
+        header('Location: /dashboard.php');
+        exit;
+    }
+
+    public function logout(): void
+    {
+        session_unset();
+        session_destroy();
+        header('Location: /index.php');
+        exit;
+    }
+}
+
+
+---FILE: app/controllers/AppointmentController.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../models/Appointment.php';
+require_once __DIR__ . '/../services/ValidationService.php';
+require_once __DIR__ . '/../services/AuditService.php';
+
+class AppointmentController
+{
+    private Appointment $model;
+    private ValidationService $validator;
+    private AuditService $audit;
+
+    public function __construct(private PDO $pdo)
+    {
+        $this->model     = new Appointment($pdo);
+        $this->validator = new ValidationService();
+        $this->audit     = new AuditService($pdo);
+    }
+
+    public function create(array $post): void
+    {
+        $errors = $this->validator->validateAppointment($post);
+        if ($errors) {
+            $_SESSION['errors'] = $errors;
+            header('Location: /appointments/create.php');
+            exit;
+        }
+
+        if ($this->model->create($post)) {
+            $id = (int)$this->model->getLastInsertId();
+            $this->audit->appointmentCreated($id, $post);
+        } else {
+            $_SESSION['errors'] = ['Unable to save appointment.'];
+        }
+
+        header('Location: /appointments/list.php');
+        exit;
+    }
+
+    public function update(int $id, array $post): void
+    {
+        $errors = $this->validator->validateAppointment($post);
+        if ($errors) {
+            $_SESSION['errors'] = $errors;
+            header("Location: /appointments/edit.php?id={$id}");
+            exit;
+        }
+
+        if ($this->model->update($id, $post)) {
+            $this->audit->appointmentUpdated($id, $post);
+        } else {
+            $_SESSION['errors'] = ['Unable to update appointment.'];
+        }
+
+        header('Location: /appointments/list.php');
+        exit;
+    }
+
+    public function delete(int $id): void
+    {
+        if ($this->model->delete($id)) {
+            $this->audit->appointmentDeleted($id);
+        } else {
+            $_SESSION['errors'] = ['Unable to delete appointment.'];
+        }
+
+        header('Location: /appointments/list.php');
+        exit;
+    }
+}
+
+
+--- FILE: app/controllers/ApiAppointmentController.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../models/Appointment.php';
+require_once __DIR__ . '/../services/JwtService.php';
+require_once __DIR__ . '/../helpers/Response.php';
+
+class ApiAppointmentController
+{
+    private Appointment $model;
+    private ?string $role = null;
+
+    public function __construct(private PDO $pdo)
+    {
+        $this->model = new Appointment($pdo);
+    }
+
+    private function authenticate(): void
+    {
+        $jwtSecret = getenv('JWT_SECRET') ?: '';
+        $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+
+        if ($jwtSecret && preg_match('/Bearer\s+(.+)/', $authHeader, $m)) {
+            $jwt = new JwtService($jwtSecret);
+            $payload = $jwt->decode($m[1]);
+            if ($payload && ($payload['exp'] ?? 0) >= time()) {
+                $this->role = $payload['role'] ?? null;
+                return;
+            }
+        }
+
+        if (isset($_SESSION['user_id'])) {
+            $this->role = $_SESSION['role'] ?? null;
+            return;
+        }
+
+        json_response(['error' => 'Unauthorised'], 401);
+    }
+
+    private function requireRole(array $roles): void
+    {
+        if ($this->role === null || !in_array($this->role, $roles, true)) {
+            json_response(['error' => 'Forbidden'], 403);
+        }
+    }
+
+    public function handle(): void
+    {
+        $this->authenticate();
+        $this->requireRole(['admin', 'clinician', 'reception']);
+
+        $method = $_SERVER['REQUEST_METHOD'];
+
+        if ($method === 'GET') {
+            $data = $this->model->getAll();
+            json_response($data);
+        } elseif ($method === 'POST') {
+            $input = json_decode(file_get_contents('php://input'), true) ?? [];
+            if ($this->model->create($input)) {
+                json_response(['status' => 'created'], 201);
+            } else {
+                json_response(['error' => 'Unable to create appointment'], 400);
+            }
+        } else {
+            json_response(['error' => 'Method not allowed'], 405);
+        }
+    }
+}
+
+
+---FILE:public/index.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../config/config.php';
+require_once __DIR__ . '/../app/controllers/AuthController.php';
+require_once __DIR__ . '/../app/security/Csrf.php';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_verify($_POST['csrf_token'] ?? null)) {
+        $_SESSION['error'] = 'Invalid request.';
+        header('Location: /index.php');
+        exit;
+    }
+    $auth = new AuthController($pdo);
+    $auth->login($_POST);
+    exit;
+}
+
+$error = $_SESSION['error'] ?? null;
+unset($_SESSION['error']);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>F Lewis Medical Centre – Login</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Staff Login</h1>
+    <?php if ($error): ?>
+        <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endif; ?>
+    <form method="post" action="/index.php" novalidate>
+        <?= csrf_field() ?>
+        <label for="email">Email</label>
+        <input type="email" name="email" id="email" required>
+
+        <label for="password">Password</label>
+        <input type="password" name="password" id="password" required>
+
+        <button type="submit">Login</button>
+    </form>
+</div>
+<script src="/assets/app.js"></script>
+</body>
+</html>
+
+
+--- FILE: public/mfa.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../config/config.php';
+require_once __DIR__ . '/../app/controllers/AuthController.php';
+require_once __DIR__ . '/../app/security/Csrf.php';
+
+if (!isset($_SESSION['pending_user_id'])) {
+    header('Location: /index.php');
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_verify($_POST['csrf_token'] ?? null)) {
+        $_SESSION['error'] = 'Invalid request.';
+        header('Location: /mfa.php');
+        exit;
+    }
+    $auth = new AuthController($pdo);
+    $auth->verifyMfa($_POST);
+    exit;
+}
+
+$error = $_SESSION['error'] ?? null;
+unset($_SESSION['error']);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MFA Verification</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Multi‑Factor Authentication</h1>
+    <?php if ($error): ?>
+        <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endif; ?>
+    <p>Enter the 6‑digit code from your authenticator app.</p>
+    <form method="post" action="/mfa.php" novalidate>
+        <?= csrf_field() ?>
+        <label for="mfa_code">MFA Code</label>
+        <input type="text" name="mfa_code" id="mfa_code" pattern="\d{6}" required>
+        <button type="submit">Verify</button>
+    </form>
+</div>
+</body>
+</html>
+
+
+--- FILE: public/dashboard.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../config/config.php';
+require_once __DIR__ . '/../app/security/Access.php';
+
+requireAuth();
+$role = $_SESSION['role'] ?? 'staff';
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>F Lewis Medical Centre – Dashboard</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Welcome to F Lewis Medical Centre</h1>
+    <p>Role: <?= htmlspecialchars($role, ENT_QUOTES, 'UTF-8') ?></p>
+
+    <nav>
+        <a href="/dashboard.php">Home</a>
+        <a href="/appointments/list.php">Appointments</a>
+        <a href="/logout.php">Logout</a>
+    </nav>
+
+    <section>
+        <h2>Personal Data</h2>
+        <p>View and manage staff personal details here.</p>
+    </section>
+
+    <?php if (in_array($role, ['admin', 'clinician', 'reception'], true)): ?>
+        <section>
+            <h2>Appointment Management</h2>
+            <p>Use the Appointments section to manage patient appointments.</p>
+        </section>
+    <?php endif; ?>
+</div>
+</body>
+</html>
+
+
+
+--- FILE: public/logout.php ---
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../config/config.php';
+require_once __DIR__ . '/../app/controllers/AuthController.php';
+
+$auth = new AuthController($pdo);
+$auth->logout();
+
+
+
+--- FILE: public/appointments/list.php ---
+
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../app/models/Appointment.php';
+require_once __DIR__ . '/../../app/security/Access.php';
+
+requireRole(['admin', 'clinician', 'reception']);
+
+$model = new Appointment($pdo);
+$appointments = $model->getAll();
+
+$errors = $_SESSION['errors'] ?? [];
+unset($_SESSION['errors']);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Appointments</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Appointments</h1>
+    <?php foreach ($errors as $e): ?>
+        <div class="error"><?= htmlspecialchars($e, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endforeach; ?>
+    <a href="/appointments/create.php">Create Appointment</a>
+    <table>
+        <thead>
+        <tr>
+            <th>Patient</th>
+            <th>DOB</th>
+            <th>Time</th>
+            <th>Clinician</th>
+            <th>Notes</th>
+            <th></th>
+        </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($appointments as $a): ?>
+            <tr>
+                <td><?= htmlspecialchars($a['last_name'] . ', ' . $a['first_name'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td><?= htmlspecialchars($a['date_of_birth'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td><?= htmlspecialchars($a['appointment_time'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td><?= htmlspecialchars($a['clinician'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td><?= htmlspecialchars($a['notes'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td>
+                    <a href="/appointments/edit.php?id=<?= (int)$a['id'] ?>">Edit</a>
+                    <a href="/appointments/delete.php?id=<?= (int)$a['id'] ?>"
+                       onclick="return confirm('Delete this appointment?')">Delete</a>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
+</body>
+</html>
+
+
+--- FILEl public/appointments/create.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../app/controllers/AppointmentController.php';
+require_once __DIR__ . '/../../app/models/Patient.php';
+require_once __DIR__ . '/../../app/security/Access.php';
+require_once __DIR__ . '/../../app/security/Csrf.php';
+
+requireRole(['admin', 'clinician', 'reception']);
+
+$patientModel = new Patient($pdo);
+$patients = $patientModel->getAll();
+
+$errors = $_SESSION['errors'] ?? [];
+unset($_SESSION['errors']);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_verify($_POST['csrf_token'] ?? null)) {
+        $_SESSION['errors'] = ['Invalid request.'];
+        header('Location: /appointments/create.php');
+        exit;
+    }
+    $controller = new AppointmentController($pdo);
+    $controller->create($_POST);
+    exit;
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Create Appointment</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Create Appointment</h1>
+
+    <?php foreach ($errors as $e): ?>
+        <div class="error"><?= htmlspecialchars($e, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endforeach; ?>
+
+    <form method="post" action="">
+        <?= csrf_field() ?>
+        <label>Patient</label>
+        <select name="patient_id" required>
+            <option value="">Select patient</option>
+            <?php foreach ($patients as $p): ?>
+                <option value="<?= (int)$p['id'] ?>">
+                    <?= htmlspecialchars($p['last_name'] . ', ' . $p['first_name'] . ' (' . $p['date_of_birth'] . ')', ENT_QUOTES, 'UTF-8') ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
+
+        <label>Appointment Time</label>
+        <input type="datetime-local" name="appointment_time" required>
+
+        <label>Clinician</label>
+        <input type="text" name="clinician" required>
+
+        <label>Notes</label>
+        <textarea name="notes"></textarea>
+
+        <button type="submit">Save</button>
+    </form>
+</div>
+</body>
+</html>
+
+
+
+--- FILE: public/appointments/edit.php ---
+
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../app/models/Appointment.php';
+require_once __DIR__ . '/../../app/models/Patient.php';
+require_once __DIR__ . '/../../app/controllers/AppointmentController.php';
+require_once __DIR__ . '/../../app/security/Access.php';
+require_once __DIR__ . '/../../app/security/Csrf.php';
+
+requireRole(['admin', 'clinician', 'reception']);
+
+$id = (int)($_GET['id'] ?? 0);
+$model = new Appointment($pdo);
+$appointment = $model->getById($id);
+if (!$appointment) {
+    exit('Appointment not found.');
+}
+
+$patientModel = new Patient($pdo);
+$patients = $patientModel->getAll();
+
+$errors = $_SESSION['errors'] ?? [];
+unset($_SESSION['errors']);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_verify($_POST['csrf_token'] ?? null)) {
+        $_SESSION['errors'] = ['Invalid request.'];
+        header("Location: /appointments/edit.php?id={$id}");
+        exit;
+    }
+    $controller = new AppointmentController($pdo);
+    $controller->update($id, $_POST);
+    exit;
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Edit Appointment</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Edit Appointment</h1>
+
+    <?php foreach ($errors as $e): ?>
+        <div class="error"><?= htmlspecialchars($e, ENT_QUOTES, 'UTF-8') ?></div>
+    <?php endforeach; ?>
+
+    <form method="post">
+        <?= csrf_field() ?>
+        <label>Patient</label>
+        <select name="patient_id" required>
+            <option value="">Select patient</option>
+            <?php foreach ($patients as $p): ?>
+                <option value="<?= (int)$p['id'] ?>"
+                    <?= $p['id'] == $appointment['patient_id'] ? 'selected' : '' ?>>
+                    <?= htmlspecialchars($p['last_name'] . ', ' . $p['first_name'] . ' (' . $p['date_of_birth'] . ')', ENT_QUOTES, 'UTF-8') ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
+
+        <label>Appointment Time</label>
+        <input type="datetime-local" name="appointment_time"
+               value="<?= htmlspecialchars(date('Y-m-d\TH:i', strtotime($appointment['appointment_time'])), ENT_QUOTES, 'UTF-8') ?>"
+               required>
+
+        <label>Clinician</label>
+        <input type="text" name="clinician"
+               value="<?= htmlspecialchars($appointment['clinician'], ENT_QUOTES, 'UTF-8') ?>" required>
+
+        <label>Notes</label>
+        <textarea name="notes"><?= htmlspecialchars($appointment['notes'], ENT_QUOTES, 'UTF-8') ?></textarea>
+
+        <button type="submit">Update</button>
+    </form>
+</div>
+</body>
+</html>
+
+
+
+--- FILE: public/appointments/delete.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../app/controllers/AppointmentController.php';
+require_once __DIR__ . '/../../app/security/Access.php';
+
+requireRole(['admin', 'clinician', 'reception']);
+
+$id = (int)($_GET['id'] ?? 0);
+$controller = new AppointmentController($pdo);
+$controller->delete($id);
+
+
+
+--- FILE: public/api/appointments.php ---
+
+Php
+
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../../config/config.php';
+require_once __DIR__ . '/../../app/controllers/ApiAppointmentController.php';
+
+$controller = new ApiAppointmentController($pdo);
+$controller->handle();
+
+
+--- FILE: public/assets/styles.css ---
+
+Css
+
+
+body {
+    font-family: Arial, sans-serif;
+    background: #f5f5f5;
+    margin: 0;
+    padding: 0;
+}
+.container {
+    max-width: 800px;
+    margin: 40px auto;
+    padding: 20px;
+    background: #ffffff;
+    border-radius: 4px;
+    box-shadow: 0 0 8px rgba(0,0,0,0.1);
+}
+h1, h2 {
+    margin-top: 0;
+}
+label {
+    display: block;
+    margin-top: 10px;
+}
+input, select, textarea {
+    width: 100%;
+    padding: 8px;
+    margin-top: 4px;
+    box-sizing: border-box;
+}
+button {
+    margin-top: 15px;
+    padding: 10px;
+    width: 100%;
+    background: #0078d4;
+    color: #fff;
+    border: none;
+    cursor: pointer;
+}
+button:hover {
+    background: #005a9e;
+}
+.error {
+    background: #fdd;
+    color: #900;
+    padding: 8px;
+    margin-bottom: 10px;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 15px;
+}
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+}
+th {
+    background: #f0f0f0;
+}
+nav a {
+    margin-right: 10px;
+}
+
+
+--- FILE: public/assets/app.js ---
+
+JavaScript
+
+document.addEventListener('DOMContentLoaded', () => {
+    const forms = document.querySelectorAll('form[novalidate]');
+    forms.forEach(form => {
+        form.addEventListener('submit', e => {
+            if (!form.checkValidity()) {
+                e.preventDefault();
+                alert('Please correct the highlighted fields.');
+            }
+        });
+    });
+});
+
+
+
+--- FILE: sql/schema.sql ---
+
+
+Sql
+
+
+-- PostgreSQL 14+ schema
+
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    mfa_secret VARCHAR(255),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE patients (
+    id SERIAL PRIMARY KEY,
+    nhs_number VARCHAR(20) UNIQUE,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    date_of_birth DATE NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE appointments (
+    id SERIAL PRIMARY KEY,
+    patient_id INTEGER NOT NULL,
+    appointment_time TIMESTAMP NOT NULL,
+    clinician VARCHAR(100) NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_appointments_patient
+        FOREIGN KEY (patient_id) REFERENCES patients(id)
+        ON DELETE RESTRICT
+);
+
+CREATE TABLE audit_log (
+    id SERIAL PRIMARY KEY,
+    event_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    user_id INTEGER,
+    role VARCHAR(50),
+    action VARCHAR(50) NOT NULL,
+    entity VARCHAR(50) NOT NULL,
+    entity_id INTEGER,
+    details JSONB,
+    ip_address VARCHAR(45),
+    user_agent TEXT
+);
+
+
+
+--- FILE: sql/seed.sql ---
+
+Sql
+
+
+INSERT INTO users (email, password_hash, role)
+VALUES (
+    'admin@example.com',
+    crypt('Password123!', gen_salt('bf')),
+    'admin'
+);
+
+INSERT INTO patients (nhs_number, first_name, last_name, date_of_birth)
+VALUES
+('1234567890', 'John', 'Doe', '1980-01-01'),
+('9876543210', 'Jane', 'Smith', '1975-05-15');
+
+
