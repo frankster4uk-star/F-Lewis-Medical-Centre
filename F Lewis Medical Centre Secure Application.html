@@ -444,11 +444,6 @@ class AuditService
     {
         $this->log->record('login_failure', 'user', null, ['email' => $email]);
     }
-
-    public function csrfFailure(string $context): void
-    {
-        $this->log->record('csrf_failure', 'security', null, ['context' => $context]);
-    }
 }
 
 
@@ -530,53 +525,6 @@ function requireRole(array $allowedRoles): void
         echo 'Access denied.';
         exit;
     }
-}
-
-function requirePermission(string $permission): void
-{
-    requireAuth();
-    $role = $_SESSION['role'] ?? '';
-    $rolePermissions = [
-        'admin' => ['manage_appointments', 'manage_users', 'view_reports'],
-        'clinician' => ['manage_appointments', 'view_reports'],
-        'reception' => ['manage_appointments'],
-        'staff' => ['view_appointments'],
-    ];
-
-    if (empty($rolePermissions[$role]) || !in_array($permission, $rolePermissions[$role], true)) {
-        http_response_code(403);
-        echo 'Permission denied.';
-        exit;
-    }
-}
-
-
---- FILE: app/security/RateLimit.php ---
-
-Php
-
-<?php
-declare(strict_types=1);
-
-function rate_limit_check(string $key, int $maxAttempts = 5, int $windowSeconds = 300): bool
-{
-    if (!isset($_SESSION['rate_limit'][$key])) {
-        $_SESSION['rate_limit'][$key] = ['count' => 0, 'reset' => time() + $windowSeconds];
-    }
-
-    $entry = &$_SESSION['rate_limit'][$key];
-
-    if (time() > $entry['reset']) {
-        $entry['count'] = 0;
-        $entry['reset'] = time() + $windowSeconds;
-    }
-
-    if ($entry['count'] >= $maxAttempts) {
-        return false;
-    }
-
-    $entry['count']++;
-    return true;
 }
 
 
@@ -829,9 +777,8 @@ class ApiAppointmentController
         if ($jwtSecret && preg_match('/Bearer\s+(.+)/', $authHeader, $m)) {
             $jwt = new JwtService($jwtSecret);
             $payload = $jwt->decode($m[1]);
-            if ($this->validateJwtPayload($payload)) {
+            if ($payload && ($payload['exp'] ?? 0) >= time()) {
                 $this->role = $payload['role'] ?? null;
-                $this->assertJwtClaims($payload);
                 return;
             }
         }
@@ -844,50 +791,6 @@ class ApiAppointmentController
         json_response(['error' => 'Unauthorised'], 401);
     }
 
-    private function validateJwtPayload(?array $payload): bool
-    {
-        if (!$payload || !is_array($payload)) {
-            return false;
-        }
-
-        $required = ['sub', 'role', 'exp', 'iat'];
-        foreach ($required as $field) {
-            if (empty($payload[$field])) {
-                return false;
-            }
-        }
-
-        if ((int)$payload['exp'] < time()) {
-            return false;
-        }
-
-        if (!in_array($payload['role'], ['admin', 'clinician', 'reception', 'staff'], true)) {
-            return false;
-        }
-
-        return true;
-    }
-
-    private function assertJwtClaims(array $payload): void
-    {
-        if (($payload['iss'] ?? '') !== getenv('JWT_ISSUER', false) && getenv('JWT_ISSUER', false) !== false) {
-            json_response(['error' => 'Invalid token issuer'], 401);
-        }
-        if (($payload['aud'] ?? '') !== getenv('JWT_AUDIENCE', false) && getenv('JWT_AUDIENCE', false) !== false) {
-            json_response(['error' => 'Invalid token audience'], 401);
-        }
-
-        $blacklist = $_SESSION['jwt_blacklist'] ?? [];
-        if (in_array($payload['jti'] ?? '', $blacklist, true)) {
-            json_response(['error' => 'Token revoked'], 401);
-        }
-
-        // simple refresh threshold enforcement
-        if ((int)$payload['exp'] - time() < 60) {
-            json_response(['error' => 'Token expiring soon, renew token'], 401);
-        }
-    }
-
     private function requireRole(array $roles): void
     {
         if ($this->role === null || !in_array($this->role, $roles, true)) {
@@ -898,20 +801,15 @@ class ApiAppointmentController
     public function handle(): void
     {
         $this->authenticate();
+        $this->requireRole(['admin', 'clinician', 'reception']);
 
         $method = $_SERVER['REQUEST_METHOD'];
 
         if ($method === 'GET') {
-            $this->requireRole(['admin', 'clinician', 'reception', 'staff']);
             $data = $this->model->getAll();
             json_response($data);
         } elseif ($method === 'POST') {
-            $this->requireRole(['admin', 'clinician']);
             $input = json_decode(file_get_contents('php://input'), true) ?? [];
-            if (!$this->isValidJsonInput($input)) {
-                json_response(['error' => 'Invalid JSON payload'], 400);
-            }
-
             if ($this->model->create($input)) {
                 json_response(['status' => 'created'], 201);
             } else {
@@ -920,11 +818,6 @@ class ApiAppointmentController
         } else {
             json_response(['error' => 'Method not allowed'], 405);
         }
-    }
-
-    private function isValidJsonInput(array $input): bool
-    {
-        return !empty($input['patient_id']) && !empty($input['appointment_time']) && !empty($input['clinician']);
     }
 }
 
@@ -938,24 +831,14 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../app/controllers/AuthController.php';
-require_once __DIR__ . '/../app/services/AuditService.php';
 require_once __DIR__ . '/../app/security/Csrf.php';
-require_once __DIR__ . '/../app/security/RateLimit.php';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!rate_limit_check('login_ip_' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown'), 5, 300)) {
-        $_SESSION['error'] = 'Too many login attempts. Please try again later.';
-        header('Location: /index.php');
-        exit;
-    }
-
     if (!csrf_verify($_POST['csrf_token'] ?? null)) {
-        (new AuditService($pdo))->csrfFailure('login');
         $_SESSION['error'] = 'Invalid request.';
         header('Location: /index.php');
         exit;
     }
-
     $auth = new AuthController($pdo);
     $auth->login($_POST);
     exit;
@@ -1002,9 +885,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../app/controllers/AuthController.php';
-require_once __DIR__ . '/../app/services/AuditService.php';
 require_once __DIR__ . '/../app/security/Csrf.php';
-require_once __DIR__ . '/../app/security/RateLimit.php';
 
 if (!isset($_SESSION['pending_user_id'])) {
     header('Location: /index.php');
@@ -1012,14 +893,7 @@ if (!isset($_SESSION['pending_user_id'])) {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!rate_limit_check('mfa_ip_' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown'), 5, 300)) {
-        $_SESSION['error'] = 'Too many MFA attempts. Please try again later.';
-        header('Location: /mfa.php');
-        exit;
-    }
-
     if (!csrf_verify($_POST['csrf_token'] ?? null)) {
-        (new AuditService($pdo))->csrfFailure('mfa');
         $_SESSION['error'] = 'Invalid request.';
         header('Location: /mfa.php');
         exit;
@@ -1130,7 +1004,7 @@ require_once __DIR__ . '/../../config/config.php';
 require_once __DIR__ . '/../../app/models/Appointment.php';
 require_once __DIR__ . '/../../app/security/Access.php';
 
-requirePermission('manage_appointments');
+requireRole(['admin', 'clinician', 'reception']);
 
 $model = new Appointment($pdo);
 $appointments = $model->getAll();
@@ -1196,10 +1070,9 @@ require_once __DIR__ . '/../../config/config.php';
 require_once __DIR__ . '/../../app/controllers/AppointmentController.php';
 require_once __DIR__ . '/../../app/models/Patient.php';
 require_once __DIR__ . '/../../app/security/Access.php';
-require_once __DIR__ . '/../../app/services/AuditService.php';
 require_once __DIR__ . '/../../app/security/Csrf.php';
 
-requirePermission('manage_appointments');
+requireRole(['admin', 'clinician', 'reception']);
 
 $patientModel = new Patient($pdo);
 $patients = $patientModel->getAll();
@@ -1209,7 +1082,6 @@ unset($_SESSION['errors']);
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!csrf_verify($_POST['csrf_token'] ?? null)) {
-        (new AuditService($pdo))->csrfFailure('appointments_create');
         $_SESSION['errors'] = ['Invalid request.'];
         header('Location: /appointments/create.php');
         exit;
@@ -1276,10 +1148,9 @@ require_once __DIR__ . '/../../app/models/Appointment.php';
 require_once __DIR__ . '/../../app/models/Patient.php';
 require_once __DIR__ . '/../../app/controllers/AppointmentController.php';
 require_once __DIR__ . '/../../app/security/Access.php';
-require_once __DIR__ . '/../../app/services/AuditService.php';
 require_once __DIR__ . '/../../app/security/Csrf.php';
 
-requirePermission('manage_appointments');
+requireRole(['admin', 'clinician', 'reception']);
 
 $id = (int)($_GET['id'] ?? 0);
 $model = new Appointment($pdo);
@@ -1296,7 +1167,6 @@ unset($_SESSION['errors']);
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!csrf_verify($_POST['csrf_token'] ?? null)) {
-        (new AuditService($pdo))->csrfFailure('appointments_edit');
         $_SESSION['errors'] = ['Invalid request.'];
         header("Location: /appointments/edit.php?id={$id}");
         exit;
@@ -1364,9 +1234,8 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../config/config.php';
 require_once __DIR__ . '/../../app/controllers/AppointmentController.php';
 require_once __DIR__ . '/../../app/security/Access.php';
-require_once __DIR__ . '/../../app/services/AuditService.php';
 
-requirePermission('manage_appointments');
+requireRole(['admin', 'clinician', 'reception']);
 
 $id = (int)($_GET['id'] ?? 0);
 $controller = new AppointmentController($pdo);
@@ -1383,15 +1252,6 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../../config/config.php';
 require_once __DIR__ . '/../../app/controllers/ApiAppointmentController.php';
-require_once __DIR__ . '/../../app/security/RateLimit.php';
-require_once __DIR__ . '/../../app/services/AuditService.php';
-
-if (!rate_limit_check('api_ip_' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown'), 100, 60)) {
-    (new AuditService($pdo))->csrfFailure('api_rate_limit');
-    http_response_code(429);
-    echo json_encode(['error' => 'Too many requests']);
-    exit;
-}
 
 $controller = new ApiAppointmentController($pdo);
 $controller->handle();
